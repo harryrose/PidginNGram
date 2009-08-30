@@ -28,6 +28,8 @@ my %SendingStatus = {};
 
 my $SendColourHex = "#0000FF";
 
+my %ignoredConvos = {};
+
 sub SaveMemory {
 	DEBUG("Storing to memory");
 	store \%NWords, $nWordsStorage;
@@ -62,7 +64,6 @@ sub ReloadMemory {
 			$NumberOfNGrams = $$No;
 		}
 	}
-	&DumpState;
 }
 
 %PLUGIN_INFO = (
@@ -89,8 +90,11 @@ sub plugin_load { my ($plugin) = @_;
 	DEBUG("Plugin loaded");
 	&ReloadMemory();
 	my $accounts_handle = Purple::Conversations::get_handle();
+
 	Purple::Signal::connect($accounts_handle, "sent-im-msg",$plugin,\&sent_callback,"");
 	Purple::Signal::connect($accounts_handle, "sending-im-msg",$plugin,\&sending_callback,"");
+	Purple::Signal::connect($accounts_handle, "conversation-created",$plugin,\&convoCreated,"");
+	Purple::Signal::connect($accounts_handle, "deleting-conversation",$plugin,\&convoDeleted,"");
 
 	# Receiving is a bit scary.  Sort this out later.
 	#Purple::Signal::connect($accounts_handle, "received-im-msg",$plugin,\&received_callback,"");
@@ -122,6 +126,24 @@ sub sending_callback{ my($account,$to,$message) = @_;
 				}
 				return;
 			}
+			elsif ($1 =~ m/^\!(.*)$/)
+			{
+				if($1 eq "ignore")
+				{
+					&ignoreUser($to);
+					$im->write("Markov","This chat will now be ignored",0,0);
+				}
+				elsif($1 eq "unignore")
+				{
+					&removeIgnore($to);
+					$im->write("Markov","This chat is no longer being ignored",0,0);
+				}
+				else
+				{
+					&writeHelpToWindow($im);
+				}
+				return;
+			}
 			elsif ($1 =~ m/^\#(.*)$/)
 			{
 				#ignore this message
@@ -139,7 +161,7 @@ sub sending_callback{ my($account,$to,$message) = @_;
 	}
 }
 
-sub getChatWithUser{ my ($username) = @_;
+sub getConvoWithUser{ my($username) = @_;
 	my $im;
 	my @convos = Purple::get_conversations();
 
@@ -147,9 +169,13 @@ sub getChatWithUser{ my ($username) = @_;
 	{
 		if($_->get_name() eq $username)
 		{
-			return $_->get_im_data();
+			return $_;
 		}
 	}
+}
+
+sub getChatWithUser{ my ($username) = @_;
+	return &getConvoWithUser($username)->get_im_data();
 }
 
 sub writeHelpToWindow { my ($imdata) = @_;
@@ -160,7 +186,10 @@ Markov - Learns vocabulary from messages you sends to folk and generates sentenc
 Commands
 	@[words]	Send a sentence that starts with the specified words
 	@@		Send a sentence that starts with randomly chosen words
+	@!ignore	Ignore this conversation
+	@!unignore	Unignore this conversation
 	@?stats		Write some statistics to your window (no data is sent)
+	@?ignored	Returns whether this conversation is ignored.
 	@?help		Prints this help
 	@#[whatever]	Send [whatever] to the chat without logging it to memory.
 HELP
@@ -168,7 +197,6 @@ HELP
 }
 
 sub plugin_unload { my ($plugin) = @_;
-	&DumpState();
 	&SaveMemory();
 	DEBUG("Plugin unloaded");
 }
@@ -176,18 +204,23 @@ sub plugin_unload { my ($plugin) = @_;
 sub sent_callback{ my ($from,$to,$msg) = @_;
 	DEBUG("\n>>>>> SENT >>>>>\n");
 	DEBUG("Sending '$msg' from '$from' to '$to'");
-	if(!exists($SendingStatus{$to}) || $SendingStatus{$to} == 0)
-	{
 
-		@sentences = &sanitiseSentences($msg);
-		
-		foreach (@sentences)
+	#get the convo this was sent in...
+	if(!&userIsIgnored($to))
+	{
+		if(!exists($SendingStatus{$to}) || $SendingStatus{$to} == 0)
 		{
-			DEBUG("Processing sentence $_");
-			&processSentence($_);
+
+			@sentences = &sanitiseSentences($msg);
+			
+			foreach (@sentences)
+			{
+				DEBUG("Processing sentence $_");
+				&processSentence($_);
+			}
+		#	DEBUG("Sanitised is ".Dumper(@sentences));
+		#	DEBUG("Generated Sentence ".&generateSentence("$beginToken how are"));
 		}
-	#	DEBUG("Sanitised is ".Dumper(@sentences));
-	#	DEBUG("Generated Sentence ".&generateSentence("$beginToken how are"));
 	}
 	$SendingStatus{$to} = 0;
 }
@@ -203,6 +236,49 @@ sub sanitiseSentences { my ($input) = "@_";
 	}
 
 	return @output;
+}
+
+sub convoCreated{ my ($convo) = @_;
+	if(&convoIsIgnored($convo))
+	{
+		my $message = "This conversation is not being learnt from.";
+		$convo->write("Markov",$message,0,0);
+	}
+}
+
+sub convoDeleted{ my($convo) = @_;
+	if(&convoIsIgnored($convo))
+	{
+		removeIgnore($convo);
+	}
+}
+
+sub convoIsIgnored{ my ($convo) = @_;
+	DEBUG("Checking if $convo is in ". Dumper(%ignoredConvos));
+	return userIsIgnored($convo->get_name());
+}
+
+sub userIsIgnored{ my ($username) = @_;
+	if(exists $ignoredConvos{$username})
+	{
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+	
+sub addToIgnore { my ($convo) = @_;
+	&ignoreUser($convo->get_name());
+}
+
+sub ignoreUser { my ($username) = @_;
+	$ignoredConvos{$username} = 1;
+}
+
+sub removeIgnore{ my ($convo) = @_;
+	delete $ignoredConvos{$convo}
 }
 
 sub sanitiseSentence { my ($sentence) = "@_";
@@ -266,8 +342,6 @@ sub updateProbabilityCache{ my ($ngram) = @_;
 	}
 }
 
-sub DumpState{
-}
 
 sub generateSentence{ my ($inputSeed) = @_;
 	DEBUG("Generating a sentence");
